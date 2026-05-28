@@ -1,0 +1,363 @@
+name: Build better-cloudflare-ip-c
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: better-cloudflare-ip-c
+  SRC_FILE: better_cf_ip.c
+
+jobs:
+  build-linux-amd64:
+    name: Build linux-amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            file \
+            ca-certificates
+      - name: Build linux-amd64
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cc -O2 -pipe -std=c11 \
+            -Wall -Wextra -Wno-unused-parameter \
+            "$SRC_FILE" \
+            -o "dist/$APP_NAME-linux-amd64" \
+            $(pkg-config --cflags --libs libcurl openssl) \
+            -pthread
+          chmod +x "dist/$APP_NAME-linux-amd64"
+          file "dist/$APP_NAME-linux-amd64"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: better-cloudflare-ip-c-linux-amd64
+          path: dist/better-cloudflare-ip-c-linux-amd64
+          if-no-files-found: error
+
+  build-linux-docker:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64
+            selector: linux-arm64
+            group: all-linux
+            platform: linux/arm64
+            image: ubuntu:24.04
+            shell: bash
+            install: apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libcurl4-openssl-dev libssl-dev file ca-certificates
+            output: better-cloudflare-ip-c-linux-arm64
+            command: cc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter better_cf_ip.c -o dist/better-cloudflare-ip-c-linux-arm64 $(pkg-config --cflags --libs libcurl openssl) -pthread
+          - target: linux-amd64-musl
+            selector: linux-amd64-musl
+            group: all-linux-musl
+            platform: linux/amd64
+            image: alpine:3.20
+            shell: sh
+            install: apk add --no-cache build-base pkgconf curl-dev openssl-dev linux-headers file ca-certificates
+            output: better-cloudflare-ip-c-linux-amd64-musl
+            command: cc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter better_cf_ip.c -o dist/better-cloudflare-ip-c-linux-amd64-musl $(pkg-config --cflags --libs libcurl openssl) -pthread
+          - target: linux-arm64-musl
+            selector: linux-arm64-musl
+            group: all-linux-musl
+            platform: linux/arm64
+            image: alpine:3.20
+            shell: sh
+            install: apk add --no-cache build-base pkgconf curl-dev openssl-dev linux-headers file ca-certificates
+            output: better-cloudflare-ip-c-linux-arm64-musl
+            command: cc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter better_cf_ip.c -o dist/better-cloudflare-ip-c-linux-arm64-musl $(pkg-config --cflags --libs libcurl openssl) -pthread
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+        if: ${{ matrix.platform == 'linux/arm64' }}
+        with:
+          cache-image: false
+      - name: Build ${{ matrix.target }} in container
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -v "$PWD:/work" \
+            -w /work \
+            "${{ matrix.image }}" \
+            ${{ matrix.shell }} -lc '${{ matrix.install }} && mkdir -p dist && ${{ matrix.command }} && file dist/${{ matrix.output }} && chown -R "$HOST_UID:$HOST_GID" dist'
+          chmod +x "dist/${{ matrix.output }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: better-cloudflare-ip-c-${{ matrix.target }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+
+  build-macos:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-amd64
+            runner: macos-15-intel
+            arch: x86_64
+            minver: "10.13"
+          - target: macos-arm64
+            runner: macos-15
+            arch: arm64
+            minver: "11.0"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          for pkg in openssl@3; do
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "$pkg already installed"
+            else
+              brew install "$pkg"
+            fi
+          done
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ] || [ ! -f "$OPENSSL_PREFIX/lib/libcrypto.a" ]; then
+            echo "::error::Missing static OpenSSL libraries under $OPENSSL_PREFIX/lib"
+            ls -la "$OPENSSL_PREFIX/lib" || true
+            exit 1
+          fi
+          clang -O2 -pipe -std=c11 \
+            -Wall -Wextra -Wno-unused-parameter \
+            -arch "${{ matrix.arch }}" \
+            -mmacosx-version-min="${{ matrix.minver }}" \
+            -I"$OPENSSL_PREFIX/include" \
+            "$SRC_FILE" \
+            -o "dist/$APP_NAME-${{ matrix.target }}" \
+            "$OPENSSL_PREFIX/lib/libssl.a" \
+            "$OPENSSL_PREFIX/lib/libcrypto.a" \
+            -lcurl -lz \
+            -framework Security \
+            -framework CoreFoundation \
+            -pthread
+          strip "dist/$APP_NAME-${{ matrix.target }}" 2>/dev/null || true
+          chmod +x "dist/$APP_NAME-${{ matrix.target }}"
+          file "dist/$APP_NAME-${{ matrix.target }}"
+          otool -L "dist/$APP_NAME-${{ matrix.target }}"
+          if otool -L "dist/$APP_NAME-${{ matrix.target }}" | grep -E '/usr/local/opt|/opt/homebrew/opt|libssl|libcrypto'; then
+            echo "::error::macOS binary still depends on Homebrew dynamic libraries"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: better-cloudflare-ip-c-${{ matrix.target }}
+          path: dist/better-cloudflare-ip-c-${{ matrix.target }}
+          if-no-files-found: error
+
+  build-windows-x86:
+    name: Build ${{ matrix.target }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-amd64
+            msystem: MINGW64
+            package_prefix: mingw-w64-x86_64
+            cc: gcc
+            winver: "0x0601"
+          - target: windows-386
+            msystem: MINGW32
+            package_prefix: mingw-w64-i686
+            cc: gcc
+            winver: "0x0601"
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            base-devel
+            ${{ matrix.package_prefix }}-${{ matrix.cc }}
+            ${{ matrix.package_prefix }}-pkgconf
+            ${{ matrix.package_prefix }}-curl
+            ${{ matrix.package_prefix }}-openssl
+            ${{ matrix.package_prefix }}-winpthreads
+            file
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          export PKG_CONFIG="pkg-config --static"
+          WIN_CFLAGS="$($PKG_CONFIG --cflags libcurl openssl)"
+          WIN_LIBS="$($PKG_CONFIG --libs libcurl openssl)"
+          echo "WIN_CFLAGS=$WIN_CFLAGS"
+          echo "WIN_LIBS=$WIN_LIBS"
+          ${{ matrix.cc }} -O2 -pipe -std=c11 \
+            -DWINVER=${{ matrix.winver }} \
+            -D_WIN32_WINNT=${{ matrix.winver }} \
+            -DCURL_STATICLIB \
+            -finput-charset=UTF-8 \
+            -fexec-charset=UTF-8 \
+            -Wall -Wextra -Wno-unused-parameter \
+            $WIN_CFLAGS \
+            "$SRC_FILE" \
+            -o "dist/$APP_NAME-${{ matrix.target }}.exe" \
+            $WIN_LIBS \
+            -lws2_32 -lcrypt32 -lbcrypt -lwinpthread \
+            -static -s
+          file "dist/$APP_NAME-${{ matrix.target }}.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: better-cloudflare-ip-c-${{ matrix.target }}
+          path: dist/better-cloudflare-ip-c-${{ matrix.target }}.exe
+          if-no-files-found: error
+
+  build-windows-arm64:
+    name: Build windows-arm64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-aarch64-headers
+            mingw-w64-clang-aarch64-crt
+            mingw-w64-clang-aarch64-compiler-rt
+            mingw-w64-clang-aarch64-libunwind
+            mingw-w64-clang-aarch64-winpthreads
+            mingw-w64-clang-aarch64-curl
+            mingw-w64-clang-aarch64-openssl
+            file
+      - name: Build windows-arm64 by cross clang
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          export TARGET_TRIPLE="aarch64-w64-windows-gnu"
+          export TARGET_SYSROOT="/clangarm64"
+          export PKG_CONFIG="/clang64/bin/pkg-config"
+          export PKG_CONFIG_LIBDIR="$TARGET_SYSROOT/lib/pkgconfig"
+          export PKG_CONFIG_PATH=""
+          export PKG_CONFIG_SYSROOT_DIR=""
+          WIN_CFLAGS="$($PKG_CONFIG --static --cflags libcurl openssl)"
+          WIN_LIBS="$($PKG_CONFIG --static --libs libcurl openssl)"
+          echo "WIN_CFLAGS=$WIN_CFLAGS"
+          echo "WIN_LIBS=$WIN_LIBS"
+          CLANG_RESOURCE_DIR="$(/clang64/bin/clang -print-resource-dir)"
+          CLANG_VERSION="$(basename "$CLANG_RESOURCE_DIR")"
+          BUILTINS_SRC="$TARGET_SYSROOT/lib/clang/$CLANG_VERSION/lib/windows/libclang_rt.builtins-aarch64.a"
+          BUILTINS_DIR="$CLANG_RESOURCE_DIR/lib/$TARGET_TRIPLE"
+          BUILTINS_DST="$BUILTINS_DIR/libclang_rt.builtins.a"
+          if [ ! -f "$BUILTINS_SRC" ]; then
+            echo "::error::Missing compiler-rt builtins: $BUILTINS_SRC"
+            find "$TARGET_SYSROOT/lib/clang" -name 'libclang_rt.builtins*' -print || true
+            exit 1
+          fi
+          mkdir -p "$BUILTINS_DIR"
+          cp -f "$BUILTINS_SRC" "$BUILTINS_DST"
+          echo "Using compiler-rt builtins: $BUILTINS_DST"
+          /clang64/bin/clang -O2 -pipe -std=c11 \
+            --target="$TARGET_TRIPLE" \
+            --sysroot="$TARGET_SYSROOT" \
+            -fuse-ld=lld \
+            -DWINVER=0x0A00 \
+            -D_WIN32_WINNT=0x0A00 \
+            -DCURL_STATICLIB \
+            -finput-charset=UTF-8 \
+            -fexec-charset=UTF-8 \
+            -Wall -Wextra -Wno-unused-parameter \
+            $WIN_CFLAGS \
+            "$SRC_FILE" \
+            -o "dist/$APP_NAME-windows-arm64.exe" \
+            $WIN_LIBS \
+            -lws2_32 -lcrypt32 -lbcrypt -lwinpthread \
+            -static -Wl,-s
+          file "dist/$APP_NAME-windows-arm64.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: better-cloudflare-ip-c-windows-arm64
+          path: dist/better-cloudflare-ip-c-windows-arm64.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build-linux-amd64, build-linux-docker, build-macos, build-windows-x86, build-windows-arm64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Assemble package
+        run: |
+          set -euo pipefail
+          mkdir -p release_assets package/bin
+          
+          # 1. 遍历下载回来的编译产物并分类处理
+          find artifacts -maxdepth 3 -type f -print0 | while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            
+            # 先复制一份到全平台大打包的临时目录
+            cp "$file" "package/bin/$name"
+            
+            # 针对不同系统做单独的带权限压缩归档，输出到 release_assets 目录中
+            if [[ "$name" == *.exe ]]; then
+              # Windows 使用 zip 格式
+              zip -j "release_assets/${name%.exe}.zip" "$file"
+            elif [[ "$name" == *macos* ]]; then
+              # macOS 赋予权限并打包为 zip
+              chmod +x "$file"
+              zip -j "release_assets/${name}.zip" "$file"
+            else
+              # Linux 赋予权限并打包为更小巧的 tar.gz
+              chmod +x "$file"
+              tar -czf "release_assets/${name}.tar.gz" -C "$(dirname "$file")" "$name"
+            fi
+          done
+          
+          # 2. 赋予全打包总项目里非 Windows 程序的执行权
+          find package/bin -type f ! -name "*.exe" -print0 | xargs -0 chmod +x || true
+          
+          # 3. 补全文本等附加资源文件
+          cp "$SRC_FILE" README.md package/
+          [ -f locations.json ] && cp locations.json package/
+          [ -f ips-v4.txt ] && cp ips-v4.txt package/
+          [ -f ips-v6.txt ] && cp ips-v6.txt package/
+          
+          # 4. 生成统一全平台包以及最终的校验和
+          (cd package && zip -r ../release_assets/better-cloudflare-ip-c-release.zip .)
+          (cd release_assets && sha256sum * > sha256sums.txt)
+          
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release_assets/*
